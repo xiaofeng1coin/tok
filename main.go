@@ -145,6 +145,14 @@ func newSigner(apkPath, runtimeDir, appKey string) (*signer, error) {
 		return nil, fmt.Errorf("genericNt1 初始化失败: %v", initResult)
 	}
 
+	// NetHelper.spr（画像上报）的 Go 桥接需要 native 签名函数 genericNt10，
+	// 必须在触发 genericNt9 之前取到，否则上报签名只能置 null。
+	if nt10 := cls.GetMethod("genericNt10", "(Ljava/lang/String;)Ljava/lang/String;"); nt10 != nil {
+		genericNt10Method = nt10
+	} else {
+		log.Printf("未找到 genericNt10，画像上报签名将置空")
+	}
+
 	// 真机 APP 初始化时会起后台线程执行 genericNt9 → genericNt11（TigerTallyAPI.runInitEx，
 	// 设备画像采集与收尾）。这条链不跑，vmpSign 输出的是降级短格式 0005_ token（439 长），
 	// 服务端点赞/分享等高危路径会拒绝；跑完后输出完整 0004_ 格式（含会话尾段）。
