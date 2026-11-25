@@ -50,7 +50,14 @@ func (h yongpaiHandler) DefineClass(ctx wrapper.FakeContext, name string) gava.F
 	if name == "com.aliyun.TigerTally.common.utils.NetHelper" {
 		cls := ctx.DefineClass(name)
 		cls.DefineMethod("spr", "(Ljava/lang/String;Ljava/util/Map;Ljava/util/Map;)Ljava/lang/String;",
-			gava.Modifier_PUBLIC|gava.Modifier_STATIC).BindCall(func(obj java.IObject, args ...any) any {
+			gava.Modifier_PUBLIC|gava.Modifier_STATIC).BindCall(func(obj java.IObject, args ...any) (result any) {
+			// 画像链里 spr 任何内部异常都不能打断 genericNt9，按 Java 版语义返回上报失败。
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("NetHelper.spr 执行异常（按上报失败处理）: %v", r)
+					result = gava.FakeString("-1#" + base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(r))))
+				}
+			}()
 			return tallyReport(args)
 		})
 		return cls
@@ -105,7 +112,11 @@ func randomUUID() string {
 // HTTP 表单上报，返回 "code#base64(body)"（网络失败返回 "-1#base64(错误)"）。
 // native 画像链依赖这个回调拿到服务端响应，所以走真实 HTTP 而不是假返回。
 func tallyReport(args []any) any {
-	target := args[0].(java.IString).String()
+	str, _ := args[0].(java.IString)
+	if str == nil || str.String() == "" {
+		return gava.FakeString("-1#" + base64.StdEncoding.EncodeToString([]byte("empty target")))
+	}
+	target := str.String()
 	headers := fakeToGoMap(args[1])
 	params := fakeToGoMap(args[2])
 
@@ -148,31 +159,12 @@ func tallyReport(args []any) any {
 	signature := "null"
 	if genericNt10Method != nil {
 		// genericNt10 是 native 方法，此刻模拟器正在执行 genericNt9（JNI 回调进入本函数），
-		// 属于模拟器嵌套调用。若运行时不支持重入可能卡死或 panic，
-		// 用带超时的独立 goroutine 防护：超时则签名置 null，走上报失败分支，服务不死锁。
-		type nt10Result struct{ sig string }
-		done := make(chan nt10Result, 1)
+		// 属于模拟器重入。unicorn 实例非线程安全，绝不能跨 goroutine 调用，
+		// 必须在当前 goroutine 同步调用；若运行时不支持重入会 panic，
+		// 由 spr 入口 recover 接住按上报失败处理，服务不崩。
 		raw := "POST|" + goEncode("/") + "|" + goEncode(sb.String())
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("genericNt10 签名异常（Signature 置 null）: %v", r)
-					done <- nt10Result{""}
-				}
-			}()
-			if res, ok := genericNt10Method.CallPrimitive(nil, gava.FakeString(raw)).(java.IString); ok {
-				done <- nt10Result{res.String()}
-				return
-			}
-			done <- nt10Result{""}
-		}()
-		select {
-		case r := <-done:
-			if r.sig != "" {
-				signature = r.sig
-			}
-		case <-time.After(10 * time.Second):
-			log.Printf("genericNt10 调用超时（Signature 置 null）")
+		if res, ok := genericNt10Method.CallPrimitive(nil, gava.FakeString(raw)).(java.IString); ok {
+			signature = res.String()
 		}
 	}
 	form.Set("Signature", signature)
