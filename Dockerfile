@@ -1,5 +1,5 @@
 # 构建阶段：编译 unicorn2 静态库和 Go 签名服务
-FROM golang:1.23-bookworm AS builder
+FROM golang:1.24-bookworm AS builder
 
 ENV CGO_ENABLED=1 \
     GOFLAGS=-buildvcs=false
