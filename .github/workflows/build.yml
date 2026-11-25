@@ -5,7 +5,17 @@ on:
     branches:
       - main
       - master
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: '镜像名（命名空间/仓库名），留空则用下方默认值'
+        required: false
+        default: ''
+
+# 手动写默认镜像名：左边改成你的 Docker Hub 登录账户名，右边是镜像仓库名，都可改。
+# 登录 Docker Hub 的用户名会自动取这个名字里 "/" 左边的部分，所以不再需要用户名 Secret。
+env:
+  DOCKERHUB_IMAGE_DEFAULT: bofbef/wtoken-server
 
 jobs:
   docker:
@@ -14,20 +24,41 @@ jobs:
       - name: 拉取仓库
         uses: actions/checkout@v4
 
+      - name: 确定镜像名
+        id: image
+        env:
+          DEFAULT_IMAGE: ${{ env.DOCKERHUB_IMAGE_DEFAULT }}
+          INPUT_IMAGE: ${{ github.event.inputs.image_name }}
+        run: |
+          name="${INPUT_IMAGE:-$DEFAULT_IMAGE}"
+          echo "image=$name" >> "$GITHUB_OUTPUT"
+          echo "username=${name%%/*}" >> "$GITHUB_OUTPUT"
+
+      - name: 校验镜像名
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.image }}
+        run: |
+          if ! printf '%s' "$IMAGE_NAME" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,127}/[a-z0-9][a-z0-9._-]{0,127}$'; then
+            echo "镜像名不合法：$IMAGE_NAME"
+            echo "格式必须是：命名空间/仓库名，命名空间用小写字母/数字/点/下划线/连字符。"
+            echo "示例：xiaofeng1coin/wtoken-server"
+            exit 1
+          fi
+
       - name: 准备 Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: 登录 Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ steps.image.outputs.username }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
       - name: 生成镜像标签
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/wtoken-server
+          images: ${{ steps.image.outputs.image }}
           tags: |
             type=raw,value=latest
             type=sha,format=long
