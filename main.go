@@ -145,6 +145,27 @@ func newSigner(apkPath, runtimeDir, appKey string) (*signer, error) {
 		return nil, fmt.Errorf("genericNt1 初始化失败: %v", initResult)
 	}
 
+	// 真机 APP 初始化时会起后台线程执行 genericNt9 → genericNt11（TigerTallyAPI.runInitEx，
+	// 设备画像采集与收尾）。这条链不跑，vmpSign 输出的是降级短格式 0005_ token（439 长），
+	// 服务端点赞/分享等高危路径会拒绝；跑完后输出完整 0004_ 格式（含会话尾段）。
+	// 模拟器环境里画像采集可能失败，失败也要继续，保持 0005_ 签名能力可用。
+	runInitStep := func(name, sig string) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("%s 执行异常（跳过继续）: %v", name, r)
+			}
+		}()
+		step := cls.GetMethod(name, sig)
+		if step == nil {
+			log.Printf("未找到 %s，跳过", name)
+			return
+		}
+		result := step.CallPrimitive(nil)
+		log.Printf("%s 返回: %v", name, result)
+	}
+	runInitStep("genericNt9", "()I")
+	runInitStep("genericNt11", "()I")
+
 	method := cls.GetMethod("genericNt3", "(I[B)Ljava/lang/String;")
 	if method == nil {
 		return nil, errors.New("未找到 genericNt3")
@@ -164,12 +185,14 @@ func newSigner(apkPath, runtimeDir, appKey string) (*signer, error) {
 }
 
 func validWToken(value string) bool {
-	if !strings.HasPrefix(value, "0005_") || !strings.HasSuffix(value, "_fHw=_") {
+	// 0004_ = initEx 画像链跑完后的完整格式（真机点赞实测可用，主体后还有会话尾段）；
+	// 0005_ = 降级短格式。两种都放行，以 _fHw=_ 分隔段存在且主体够长为准。
+	if !strings.HasPrefix(value, "0004_") && !strings.HasPrefix(value, "0005_") {
 		return false
 	}
-	body := strings.TrimSuffix(strings.TrimPrefix(value, "0005_"), "_fHw=_")
+	idx := strings.Index(value, "_fHw=_")
 	// 主体固定包含 10 位时间 + 2 位状态 + 96 位签名段 + Base64 密文，最短也应超过 100 字符。
-	return len(body) > 100
+	return idx > 100
 }
 
 // sign 调用 genericNt3 生成 wToken；服务日志只记录长度和格式布尔值，不输出 token 本体。
@@ -190,10 +213,10 @@ func (s *signer) sign(payload []byte) (token string, err error) {
 	}
 	if !validWToken(value.String()) {
 		return "", fmt.Errorf(
-			"genericNt3 未返回格式正确的 wToken（长度=%d，前缀=%v，后缀=%v）",
+			"genericNt3 未返回格式正确的 wToken（长度=%d，前缀0004=%v，前缀0005=%v）",
 			len(value.String()),
+			strings.HasPrefix(value.String(), "0004_"),
 			strings.HasPrefix(value.String(), "0005_"),
-			strings.HasSuffix(value.String(), "_fHw=_"),
 		)
 	}
 	return value.String(), nil
@@ -288,6 +311,24 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	// 根路径返回服务信息，方便浏览器直接打开确认服务存活。
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "仅支持 GET"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"service": "wtoken-server",
+			"status":  "ok",
+			"health":  "GET /healthz",
+			"sign":    "POST /wtoken",
+		})
 	})
 
 	server := &http.Server{
