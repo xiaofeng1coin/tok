@@ -114,7 +114,7 @@ func tallyReport(args []any) any {
 	form.Set("TimestampKeep", now)
 	form.Set("SignatureNonce", randomUUID())
 	if params != nil {
-		delete(params, "Signature")
+		delete(params, gava.FakeString("Signature"))
 		for k, v := range params {
 			key, _ := k.(java.IString)
 			value, _ := v.(java.IString)
@@ -147,18 +147,33 @@ func tallyReport(args []any) any {
 	}
 	signature := "null"
 	if genericNt10Method != nil {
-		func() {
+		// genericNt10 是 native 方法，此刻模拟器正在执行 genericNt9（JNI 回调进入本函数），
+		// 属于模拟器嵌套调用。若运行时不支持重入可能卡死或 panic，
+		// 用带超时的独立 goroutine 防护：超时则签名置 null，走上报失败分支，服务不死锁。
+		type nt10Result struct{ sig string }
+		done := make(chan nt10Result, 1)
+		raw := "POST|" + goEncode("/") + "|" + goEncode(sb.String())
+		go func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("genericNt10 签名异常（Signature 置 null）: %v", r)
+					done <- nt10Result{""}
 				}
 			}()
-			// cs() 原文：POST|encode("/")|encode(query)，两段之间各一个分隔符。
-			raw := "POST|" + goEncode("/") + "|" + goEncode(sb.String())
 			if res, ok := genericNt10Method.CallPrimitive(nil, gava.FakeString(raw)).(java.IString); ok {
-				signature = res.String()
+				done <- nt10Result{res.String()}
+				return
 			}
+			done <- nt10Result{""}
 		}()
+		select {
+		case r := <-done:
+			if r.sig != "" {
+				signature = r.sig
+			}
+		case <-time.After(10 * time.Second):
+			log.Printf("genericNt10 调用超时（Signature 置 null）")
+		}
 	}
 	form.Set("Signature", signature)
 
