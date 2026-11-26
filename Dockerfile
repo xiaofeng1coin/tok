@@ -11,6 +11,8 @@ RUN apt-get update && \
 WORKDIR /src
 
 COPY go.mod go.sum ./
+# replace 指向本地 third_party，下载依赖前必须先把该模块放进去。
+COPY third_party/ ./third_party/
 RUN go mod download
 
 COPY . .
@@ -27,6 +29,10 @@ RUN git clone --depth 1 --branch 2.1.4 https://github.com/unicorn-engine/unicorn
     cmake --install /tmp/unicorn/build
 
 RUN CGO_CFLAGS="-I/usr/local/include" \
+    CGO_LDFLAGS="-L/usr/local/lib -lunicorn -lpthread -lm" \
+    WTOKEN_ALLOW_REPORT_NETWORK=0 \
+    go test ./... github.com/wnxd/microdbg/internal/debugger github.com/wnxd/microdbg-android/internal/10 && \
+    CGO_CFLAGS="-I/usr/local/include" \
     CGO_LDFLAGS="-L/usr/local/lib -lunicorn -lpthread -lm" \
     go build -trimpath -ldflags "-s -w" -o /out/wtoken-server .
 

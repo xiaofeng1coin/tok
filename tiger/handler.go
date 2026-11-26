@@ -165,8 +165,12 @@ func (h Handler) DefineClass(ctx wrapper.FakeContext, name string) gava.FakeClas
 func (h Handler) DefineMethod(ctx wrapper.FakeContext, clazz gava.FakeClass, name, sig string) (method gava.FakeMethod) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("DefineMethod 异常，类=%s，方法=%s%s: %v", clazz.GetName(), name, sig, r)
-			method = nil
+			// 内置类（java.lang.Class 等）没有内部工厂，clazz.DefineMethod 会 panic；
+			// 必须改走 ctx 工厂构造并绑定兜底实现再返回，否则 wrapper 层会兜底出
+			// 未绑定方法，native 调用时 panic not implemented 打断画像链。
+			log.Printf("DefineMethod 内置类兜底，类=%s，方法=%s%s: %v", clazz.GetName(), name, sig, r)
+			method = ctx.DefineMethod(clazz, name, sig, gava.Modifier_PUBLIC)
+			method.BindCall(defaultReturn(sig))
 		}
 	}()
 	// 类上已有绑定实现的方法直接返回（DefineClass 里定义过的优先）。
@@ -191,8 +195,20 @@ func (h Handler) DefineMethod(ctx wrapper.FakeContext, clazz gava.FakeClass, nam
 func (h Handler) DefineStaticMethod(ctx wrapper.FakeContext, clazz gava.FakeClass, name, sig string) (method gava.FakeMethod) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("DefineStaticMethod 异常，类=%s，方法=%s%s: %v", clazz.GetName(), name, sig, r)
-			method = nil
+			log.Printf("DefineStaticMethod 内置类兜底，类=%s，方法=%s%s: %v", clazz.GetName(), name, sig, r)
+			method = ctx.DefineMethod(clazz, name, sig, gava.Modifier_PUBLIC|gava.Modifier_STATIC)
+			// Class.forName 返回 null 会让 native 画像逻辑 NPE，按语义解析类名；
+			// 未注册的类 ctx.GetClass 会自动定义空类，后续字段/方法读取走兜底。
+			if clazz.GetName().String() == "java.lang.Class" && name == "forName" {
+				method.BindCall(func(obj java.IObject, args ...any) any {
+					if s, ok := args[0].(java.IString); ok && s != nil && s.String() != "" {
+						return ctx.GetClass(s.String())
+					}
+					return nil
+				})
+				return
+			}
+			method.BindCall(defaultReturn(sig))
 		}
 	}()
 	if m := clazz.FindMethod(name, sig); m != nil {
@@ -205,8 +221,10 @@ func (h Handler) DefineStaticMethod(ctx wrapper.FakeContext, clazz gava.FakeClas
 func (h Handler) DefineField(ctx wrapper.FakeContext, clazz gava.FakeClass, name, sig string) (field gava.FakeField) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("DefineField 异常，类=%s，字段=%s%s: %v", clazz.GetName(), name, sig, r)
-			field = nil
+			log.Printf("DefineField 内置类兜底，类=%s，字段=%s%s: %v", clazz.GetName(), name, sig, r)
+			field = ctx.DefineField(clazz, name, sig, gava.Modifier_PUBLIC)
+			field.BindGet(fieldFallbackValue(clazz, name, sig))
+			field.BindSet(func(obj java.IObject, value any) {})
 		}
 	}()
 	if f := clazz.FindField(name, sig); f != nil {
@@ -223,8 +241,10 @@ func (h Handler) DefineField(ctx wrapper.FakeContext, clazz gava.FakeClass, name
 func (h Handler) DefineStaticField(ctx wrapper.FakeContext, clazz gava.FakeClass, name, sig string) (field gava.FakeField) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("DefineStaticField 异常，类=%s，字段=%s%s: %v", clazz.GetName(), name, sig, r)
-			field = nil
+			log.Printf("DefineStaticField 内置类兜底，类=%s，字段=%s%s: %v", clazz.GetName(), name, sig, r)
+			field = ctx.DefineField(clazz, name, sig, gava.Modifier_PUBLIC|gava.Modifier_STATIC)
+			field.BindGet(fieldFallbackValue(clazz, name, sig))
+			field.BindSet(func(obj java.IObject, value any) {})
 		}
 	}()
 	if f := clazz.FindField(name, sig); f != nil {

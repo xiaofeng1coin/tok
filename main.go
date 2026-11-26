@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,6 +41,7 @@ type signer struct {
 	emu    emulator.Emulator
 	art    android.Runtime
 	module android.Module
+	linker *linkerSymbols
 	method java.IMethod
 }
 
@@ -114,9 +116,29 @@ func newSigner(apkPath, runtimeDir, appKey string) (*signer, error) {
 		"TT_COOKIEID_NEW": gava.FakeString(randomBase64(64)),
 	})
 
+	// TigerTally 延迟重定位会解析 linker 私有符号 __loader_dladdr，
+	// microdbg-android 内部符号表没有注册它，必须在加载模块前补上虚拟实现。
+	cleanupLinker := true
+	linker, err := registerLinkerSymbols(art.Debugger())
+	if err != nil {
+		return nil, fmt.Errorf("注册 linker 符号失败: %w", err)
+	}
+	defer func() {
+		if cleanupLinker {
+			_ = linker.Close()
+		}
+	}()
+
 	module, err := pkg.LoadModule(context.Background(), art, "tiger_tally")
 	if err != nil {
 		return nil, fmt.Errorf("加载 tiger_tally 失败: %w", err)
+	}
+	knownModules := []string{"libc.so", "libdl.so", "libc++_shared.so", "libtiger_tally.so", "linker64", "binfmt"}
+	for _, name := range knownModules {
+		if m, err := art.Debugger().FindModule(name); err == nil {
+			base, size := m.Region()
+			log.Printf("模块表 %s 基址=0x%x 大小=0x%x", name, base, size)
+		}
 	}
 	cleanupModule := true
 	defer func() {
@@ -153,33 +175,38 @@ func newSigner(apkPath, runtimeDir, appKey string) (*signer, error) {
 		log.Printf("未找到 genericNt10，画像上报签名将置空")
 	}
 
-	// 真机 APP 初始化时会起后台线程执行 genericNt9 → genericNt11（TigerTallyAPI.runInitEx，
-	// 设备画像采集与收尾）。这条链不跑，vmpSign 输出的是降级短格式 0005_ token（439 长），
-	// 服务端点赞/分享等高危路径会拒绝；跑完后输出完整 0004_ 格式（含会话尾段）。
-	// 模拟器环境里画像采集可能失败，失败也要继续，保持 0005_ 签名能力可用。
-	runInitStep := func(name, sig string) {
+	// 真机在 genericNt1 之后执行扩展初始化。原生异常会使模拟器进入错误状态，
+	// 此时不能吞掉异常后继续签名；网络上报失败等正常返回则保留原生处理结果。
+	runInitStep := func(name, sig string) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("%s 执行异常（跳过继续）: %v", name, r)
+				err = fmt.Errorf("%s 原生执行异常: %v", name, r)
 			}
 		}()
 		step := cls.GetMethod(name, sig)
 		if step == nil {
-			log.Printf("未找到 %s，跳过", name)
-			return
+			return fmt.Errorf("未找到 %s", name)
 		}
 		result := step.CallPrimitive(nil)
 		log.Printf("%s 返回: %v", name, result)
+		if status, ok := result.(java.JInt); ok && status != 0 {
+			log.Printf("%s 扩展初始化未成功，本地签名可用不代表业务服务端接受签名", name)
+		}
+		return nil
 	}
-	runInitStep("genericNt9", "()I")
-	runInitStep("genericNt11", "()I")
+	if err := runInitStep("genericNt9", "()I"); err != nil {
+		return nil, err
+	}
+	if err := runInitStep("genericNt11", "()I"); err != nil {
+		return nil, err
+	}
 
 	method := cls.GetMethod("genericNt3", "(I[B)Ljava/lang/String;")
 	if method == nil {
 		return nil, errors.New("未找到 genericNt3")
 	}
 
-	s := &signer{emu: emu, art: art, module: module, method: method}
+	s := &signer{emu: emu, art: art, module: module, linker: linker, method: method}
 	// 使用已知可出签名的测试字节做启动预热，空切片在原生桥接上可能被视为 nil 数组。
 	if _, err := s.sign([]byte("hello")); err != nil {
 		return nil, fmt.Errorf("启动预热失败: %w", err)
@@ -188,13 +215,14 @@ func newSigner(apkPath, runtimeDir, appKey string) (*signer, error) {
 	cleanupEmu = false
 	cleanupArt = false
 	cleanupModule = false
+	cleanupLinker = false
 	log.Printf("模拟器初始化完成，耗时 %s", time.Since(started).Round(time.Millisecond))
 	return s, nil
 }
 
 func validWToken(value string) bool {
-	// 0004_ = initEx 画像链跑完后的完整格式（真机点赞实测可用，主体后还有会话尾段）；
-	// 0005_ = 降级短格式。两种都放行，以 _fHw=_ 分隔段存在且主体够长为准。
+	// 这里只检查已观察到的两种格式；前缀不能证明画像上报成功或业务服务端接受。
+	// 两种格式都要求 _fHw=_ 分隔段存在且主体够长。
 	if !strings.HasPrefix(value, "0004_") && !strings.HasPrefix(value, "0005_") {
 		return false
 	}
@@ -235,6 +263,9 @@ func (s *signer) Close() {
 	defer s.mu.Unlock()
 	if s.module != nil {
 		_ = s.module.Close()
+	}
+	if s.linker != nil {
+		_ = s.linker.Close()
 	}
 	if s.art != nil {
 		_ = s.art.Close()
@@ -340,7 +371,7 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:              ":" + port,
+		Addr:              net.JoinHostPort(envOr("LISTEN_HOST", ""), port),
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,

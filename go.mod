@@ -27,3 +27,13 @@ require (
 	golang.org/x/sys v0.31.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
 )
+
+// 修复上游 socket stub 的 panic：模拟器网络探测失败时返回 ENOSYS，不中断画像链。
+replace github.com/wnxd/microdbg-linux => ./third_party/microdbg-linux
+
+// 扩大模拟器主线程栈到 8MB（原 80KB）：TigerTally 画像采集函数单帧 0x1A000，
+// 原栈直接压栈越界 MEM_WRITE_UNMAPPED，中断整条 initEx 画像链。
+replace github.com/wnxd/microdbg => ./third_party/microdbg
+
+// 为线程控制块单独预留 TLS 槽空间，避免 pthread_setspecific(key 0) 覆盖 TLS 指针。
+replace github.com/wnxd/microdbg-android => ./third_party/microdbg-android

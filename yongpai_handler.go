@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -99,6 +100,25 @@ func goEncode(s string) string {
 	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
 }
 
+// reportSigningText 与 NetHelper.cs 一致：排序、逐项编码后，再编码整段查询串。
+func reportSigningText(form url.Values) string {
+	keys := make([]string, 0, len(form))
+	for key := range form {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for i, key := range keys {
+		if i > 0 {
+			sb.WriteByte('&')
+		}
+		sb.WriteString(goEncode(key))
+		sb.WriteByte('=')
+		sb.WriteString(goEncode(form.Get(key)))
+	}
+	return "POST&" + goEncode("/") + "&" + goEncode(sb.String())
+}
+
 // randomUUID 生成 UUIDv4 格式随机串，供 SignatureNonce 使用。
 func randomUUID() string {
 	var b [16]byte
@@ -110,8 +130,16 @@ func randomUUID() string {
 
 // tallyReport 复刻 TigerTally NetHelper.spr：构造公共参数 → genericNt10 计算签名 →
 // HTTP 表单上报，返回 "code#base64(body)"（网络失败返回 "-1#base64(错误)"）。
-// native 画像链依赖这个回调拿到服务端响应，所以走真实 HTTP 而不是假返回。
+// 默认禁止外发；显式设置 WTOKEN_ALLOW_REPORT_NETWORK=1 才允许真实上报。
+// 离线返回失败，不伪造服务端响应或成功状态。
 func tallyReport(args []any) any {
+	if os.Getenv("WTOKEN_ALLOW_REPORT_NETWORK") != "1" {
+		log.Printf("画像上报已阻断（离线模式）")
+		return gava.FakeString("-1#" + base64.StdEncoding.EncodeToString([]byte("offline: profile reporting is disabled")))
+	}
+	if len(args) != 3 {
+		return gava.FakeString("-1#" + base64.StdEncoding.EncodeToString([]byte("invalid report arguments")))
+	}
 	str, _ := args[0].(java.IString)
 	if str == nil || str.String() == "" {
 		return gava.FakeString("-1#" + base64.StdEncoding.EncodeToString([]byte("empty target")))
@@ -141,28 +169,14 @@ func tallyReport(args []any) any {
 		}
 	}
 
-	// cs()：参数按 key 字典序拼成 query 串，签名原文 = "POST|/|encode(query)"。
-	keys := make([]string, 0, len(form))
-	for k := range form {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var sb strings.Builder
-	for i, k := range keys {
-		if i > 0 {
-			sb.WriteByte('&')
-		}
-		sb.WriteString(goEncode(k))
-		sb.WriteByte('=')
-		sb.WriteString(goEncode(form.Get(k)))
-	}
+	// Java 的 SIGN_SPLIT_SYMBOL 是 &，不能用 | 替代。
 	signature := "null"
 	if genericNt10Method != nil {
 		// genericNt10 是 native 方法，此刻模拟器正在执行 genericNt9（JNI 回调进入本函数），
 		// 属于模拟器重入。unicorn 实例非线程安全，绝不能跨 goroutine 调用，
 		// 必须在当前 goroutine 同步调用；若运行时不支持重入会 panic，
 		// 由 spr 入口 recover 接住按上报失败处理，服务不崩。
-		raw := "POST|" + goEncode("/") + "|" + goEncode(sb.String())
+		raw := reportSigningText(form)
 		if res, ok := genericNt10Method.CallPrimitive(nil, gava.FakeString(raw)).(java.IString); ok {
 			signature = res.String()
 		}
